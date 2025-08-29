@@ -105,7 +105,7 @@ def run_gui(shelf_count):
 
 
 class WarehouseExplore(Node):
-	""" Initializes warehouse explorer node with the required publishers and subscriptions.
+	""" HELLOOO Initializes warehouse explorer node with the required publishers and subscriptions.
 
 		Returns:
 			None
