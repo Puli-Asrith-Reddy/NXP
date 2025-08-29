@@ -1,0 +1,16 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/darshan/cognipilot/cranium/install/corti/local/lib/python3.10/dist-packages",
+        "/home/darshan/cognipilot/cranium/install/b3rb_ros_aim_india/lib/python3.10/site-packages",
+        "/home/darshan/cognipilot/cranium/install/synapse_msgs/local/lib/python3.10/dist-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/darshan/cognipilot/cranium/install/corti/local/lib/python3.10/dist-packages",
+        "/home/darshan/cognipilot/cranium/install/b3rb_ros_aim_india/lib/python3.10/site-packages",
+        "/home/darshan/cognipilot/cranium/install/synapse_msgs/local/lib/python3.10/dist-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
+}

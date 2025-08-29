@@ -53,6 +53,7 @@ class MapVisualizer(Node):
 		# Convert the occupancy data to a NumPy array.
 		data = np.array(message.data).reshape((height, width))
 
+		
 		# Create an RGB image array.
 		image = np.zeros((height, width, 3), dtype=np.uint8)
 

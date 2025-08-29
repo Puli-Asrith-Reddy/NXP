@@ -19,6 +19,7 @@ from rclpy.node import Node
 from rclpy.timer import Timer
 from rclpy.action import ActionClient
 from rclpy.parameter import Parameter
+from rclpy.callback_groups import ReentrantCallbackGroup
 
 import math
 import time
@@ -27,6 +28,9 @@ import cv2
 from typing import Optional, Tuple
 import asyncio
 import threading
+from sklearn.cluster import DBSCAN
+import matplotlib.pyplot as plt
+
 
 from sensor_msgs.msg import Joy
 from sensor_msgs.msg import LaserScan
@@ -62,6 +66,8 @@ class WindowProgressTable:
 		self.root = root
 		self.root.title("Shelf Objects & QR Link")
 		self.root.attributes("-topmost", True)
+	
+
 
 		self.row_count = 2
 		self.col_count = shelf_count
@@ -106,6 +112,37 @@ class WarehouseExplore(Node):
 	"""
 	def __init__(self):
 		super().__init__('warehouse_explore')
+		
+		self.clusters_to_visit = []
+		
+		
+		self.shelf_id=-1
+		self.shelf_idx = None
+
+		#FLAGS 
+		self.timer_flag=True
+		self.in_shelf_mode = False
+		self.flag_for_one_call=True
+		self.reached_offset_goal = False 
+		self.first_extra_offset=True
+		
+		
+		self.diagonal_clusters = []
+		self.visited_qr_side = False
+		self.visited_qr_side_2=False
+		self.heuristic_angle = None
+
+
+		self.allowed_objects = ['banana', 'car', 'clock', 'cup', 'horse', 'potted plant', 'teddy bear', 'zebra']
+
+
+
+
+		self.shelf_number=1
+
+		self.shelf_qr_data=WarehouseShelf()
+		
+		self.qr_detector = cv2.QRCodeDetector() 
 
 		self.action_client = ActionClient(
 			self,
@@ -233,6 +270,13 @@ class WarehouseExplore(Node):
 		self.buggy_pose_x = message.pose.pose.position.x
 		self.buggy_pose_y = message.pose.pose.position.y
 		self.buggy_center = (self.buggy_pose_x, self.buggy_pose_y)
+		
+		if not hasattr(self, 'initial_ref_pose') or self.initial_ref_pose is None:
+			self.initial_ref_pose = message  # Store early pose once
+			self.get_logger().info(f"✅ Stored initial reference pose at x={message.pose.pose.position.x:.2f}, y={message.pose.pose.position.y:.2f}")
+
+
+
 
 	def simple_map_callback(self, message):
 		"""Callback function to handle simple map updates.
@@ -249,6 +293,127 @@ class WarehouseExplore(Node):
 			map_info.width / 2, map_info.height / 2, map_info
 		)
 
+	def get_clusters_dbscan(self,
+        map_data,
+        map_info,
+        shelf_width   = 1.4,   # metres
+        shelf_height  = 0.5,   # metres
+        tolerance     = 0.25,  # metres
+        plot=False):
+		"""
+		Detect shelf sized clusters in an occupancy grid using DBSCAN.
+
+		Args
+		----
+		map_data : 2D numpy array of int8/uint8
+			OccupancyGrid.data reshaped to [height, width].
+		map_info : nav_msgs/OccupancyGrid.info
+			Provides .resolution (m/px) and .origin (geometry_msgs/Pose).
+		shelf_width, shelf_height : float
+			Expected shelf footprint (metres).  Swap tolerated.
+		tolerance : float
+			Size tolerance (metres).
+		plot : bool
+			If True, show a matplotlib figure like the one you posted.
+
+		Returns
+		-------
+		list[dict]
+			One dict per matching cluster:
+			{
+				'centroid_map'  : (cx_px, cy_px),     # in pixel coords
+				'centroid_world': (wx_m, wy_m),       # map frame (metres)
+				'width_m'       : cluster_width,      # metres (long side)
+				'height_m'      : cluster_height,     # metres (short side)
+				'angle_deg'     : rotation_ccw        # degrees
+			}
+		"""
+
+		res   = map_info.resolution                # m / cell
+		origin= map_info.origin                    # geometry_msgs/Pose
+
+		# ------------------------------------------------------------------ #
+		# 1. Extract every occupied cell (value 100)
+		# ------------------------------------------------------------------ #
+		occupied = np.argwhere(map_data == 100)    # [[row, col], ...]
+		if occupied.size == 0:
+			return []
+
+		# DBSCAN expects (x, y).  Our array is (row=y, col=x).
+		coords_px = occupied[:, [1, 0]]            # swap to (x, y)
+
+		# ------------------------------------------------------------------ #
+		# 2. DBSCAN clustering (distance in *pixels*)
+		#    eps ≈ half the longest shelf side, converted to pixels.
+		# ------------------------------------------------------------------ #
+		eps_px = int(max(shelf_width, shelf_height) / res / 2.5) or 1
+		db     = DBSCAN(eps=eps_px, min_samples=5).fit(coords_px)
+		labels = db.labels_
+
+		clusters = []
+		show = plot
+		if show:
+			fig, ax = plt.subplots()
+			ax.set_aspect('equal')
+
+		for cid in set(labels):
+			if cid == -1:
+				continue   # noise
+
+			pts_px = coords_px[labels == cid]              # (N,2)
+
+			# ------------------------------------------------------------------ #
+			# 3. Get a minimum‑area rotated box around the points
+			# ------------------------------------------------------------------ #
+			if pts_px.shape[0] < 5:
+				continue
+			rect= cv2.minAreaRect(pts_px.astype(np.float32))
+			(cx, cy), (w, h), angle = rect                 # cx,cy in px; w,h in px
+			width_m, height_m = w * res, h * res
+
+			# Accept either orientation (width≈1.4 & height≈0.5, or vice‑versa)
+			good_size = (
+				abs(width_m  - shelf_width ) < tolerance and
+				abs(height_m - shelf_height) < tolerance
+			) or (
+				abs(width_m  - shelf_height) < tolerance and
+				abs(height_m - shelf_width ) < tolerance
+			)
+			if not good_size:
+				continue
+
+			# World (map frame) metres
+			wx = origin.position.x + cx * res
+			wy = origin.position.y + cy * res
+
+			clusters.append({
+				'centroid_map'  : (cx, cy),
+				'centroid_world': (wx, wy),
+				'width_m'       : width_m,
+				'height_m'      : height_m,
+				'angle_deg'     : angle
+			})
+
+			# ------------------------------------------------------------------ #
+			# 4. Optional live plot
+			# ------------------------------------------------------------------ #
+			if show:
+				box = cv2.boxPoints(rect).astype(int)
+				ax.plot(pts_px[:, 0], pts_px[:, 1], '.', label=f'cluster {cid}')
+				ax.plot(cx, cy, 'kx')
+				ax.add_patch(plt.Polygon(box, closed=True,
+										fill=False, edgecolor='red', linewidth=1))
+				ax.text(cx, cy, f'{cid}', ha='center', va='center')
+
+		if show:
+			ax.invert_yaxis()        # pixel (0,0) at top‑left like an image
+			ax.legend()
+			plt.title('Shelf clusters detected (DBSCAN)')
+			plt.show()
+
+		return clusters
+
+
 	def global_map_callback(self, message):
 		"""Callback function to handle global map updates.
 
@@ -259,6 +424,7 @@ class WarehouseExplore(Node):
 			None
 		"""
 		self.global_map_curr = message
+		
 
 		if not self.goal_completed:
 			return
@@ -297,7 +463,457 @@ class WarehouseExplore(Node):
 			self.full_map_explored_count = 0
 		else:
 			self.full_map_explored_count += 1
-			print(f"Nothing found in frontiers; count = {self.full_map_explored_count}")
+
+			self.get_logger().info("No frontiers found. Proceeding to clustering.")
+
+			self.clusters = self.get_clusters_dbscan(map_array, map_info, plot=False)
+
+			
+			self.in_shelf_mode = True
+
+			if self.in_shelf_mode  and self.flag_for_one_call:
+
+				self.shelf_qr_data.object_count=[]
+				self.shelf_qr_data.object_name=[]
+
+				
+				self.select_first_shelf_from_initial_angle()
+				self.flag_for_one_call=False
+				
+
+	def send_next_shelf_goal(self):
+		
+		
+
+
+		shelf = self.clusters[self.shelf_idx]
+		x, y = shelf['centroid_world']
+		angle_deg = shelf['angle_deg']
+		width_m = shelf['width_m']
+		height_m = shelf['height_m']
+
+
+		if width_m > height_m:
+			face_angle_deg = angle_deg + 90
+		else:
+			face_angle_deg = angle_deg
+
+		face_angle_deg = face_angle_deg % 360
+		
+		
+
+		offset_x, offset_y = self.offset_goal_away_from_shelf(x, y, face_angle_deg)
+		yaw_rad = self.create_yaw_from_vector(x,y,offset_x,offset_y)
+
+		self.clear_shelf_qr_data()
+		
+		goal = self.create_goal_from_world_coord(offset_x, offset_y, yaw_rad)
+		success = self.send_goal_from_world_pose(goal)
+
+		if success:
+			self.logger.info(f" Going to Shelf {self.shelf_idx+ 1} at {offset_x:.2f}, {offset_y:.2f}")
+		else:
+			self.logger.warn(f" Could not send goal for shelf {self.shelf_idx + 1}.")
+			
+		
+	def offset_goal_away_from_shelf(self,x, y, angle_deg, offset=2.2):
+		angle_rad = math.radians(angle_deg)
+		# Move backward along the shelf normal (negative direction
+		offset_x = x - offset * math.cos(angle_rad)
+		offset_y = y - offset * math.sin(angle_rad)
+		return offset_x, offset_y
+	
+	def goal_result_callback(self, future):
+		"""
+		Callback function executed when the navigation goal reaches a final result.
+
+		Args:
+			future (rclpy.Future): check_shelf_after_goalThe future that is result of the navigation action.
+		"""
+		status = future.result().status
+		# NOTE: Refer https://docs.ros2.org/foxy/api/action_msgs/msg/GoalStatus.html.
+
+		if status == GoalStatus.STATUS_SUCCEEDED:
+			self.logger.info("Goal completed successfully!")
+		else:
+			self.logger.warn(f"Goal failed with status: {status}")
+
+		self.goal_completed = True  # Mark goal as completed.
+		self.goal_handle_curr = None  # Clear goal handle.
+
+		self.get_logger().info(f"check {self.shelf_qr_data.object_name}")
+
+
+		
+			
+
+		#only for first shelf
+		if self.in_shelf_mode :
+			
+			if not self.visited_qr_side:
+
+				if self.first_extra_offset:
+					self.clear_shelf_qr_data()
+
+					shelf = self.clusters[self.shelf_idx]
+					x, y = shelf['centroid_world']
+					angle_deg = shelf['angle_deg']
+					width_m = shelf['width_m']
+					height_m = shelf['height_m']
+
+					if width_m > height_m:
+						face_angle_deg = angle_deg + 90
+					else:
+						face_angle_deg = angle_deg
+
+					face_angle_deg = face_angle_deg % 360
+
+					# 📍 First offset from shelf
+					offset_x, offset_y = self.offset_goal_away_from_shelf(x, y, face_angle_deg)
+					yaw_rad = self.create_yaw_from_vector(x, y, offset_x, offset_y)
+
+					# ➕ Extra offset in the same direction (20 cm or whatever you choose)
+					extra_offset = 1.0 # meters
+					extra_x = offset_x - extra_offset * math.cos(yaw_rad)
+					extra_y = offset_y - extra_offset * math.sin(yaw_rad)
+
+					goal = self.create_goal_from_world_coord(extra_x, extra_y, yaw_rad)
+					success = self.send_goal_from_world_pose(goal)
+
+					if success:
+						self.get_logger().info("extra offset goal sent")				
+					self.first_extra_offset = False
+					return
+				
+				else:
+
+					
+					self.visited_qr_side = True
+					self.get_logger().info("Going to QR side...")
+					self.check_shelf_after_goal()
+					
+				  # Exit early so we don't publish now
+			else:		
+					self.publisher_shelf_data.publish(self.shelf_qr_data)
+					self.get_logger().info("data published")
+					
+					self.clear_shelf_qr_data()
+					self.in_shelf_mode = False
+	
+					self.select_next_shelf_from_heuristic()
+					return
+
+		#other shelves
+		if self.shelf_number >1  :
+			
+			if not self.visited_qr_side_2:
+
+				if self.reached_offset_goal == False : 
+					self.get_logger().info("starting 1m offset")
+
+					extra_offset = 1.0 # 100 cm
+					extra_x = self.offset_x - extra_offset * math.cos(self.yaw_rad)
+					extra_y = self.offset_y - extra_offset * math.sin(self.yaw_rad)
+
+					self.reached_offset_goal = True 
+					extra_goal = self.create_goal_from_world_coord(extra_x, extra_y, self.yaw_rad)
+					self.send_goal_from_world_pose(extra_goal)		
+					return
+
+				else:
+					self.get_logger().info("going to the Qr side")
+					self.visited_qr_side_2 = True
+					self.reached_offset_goal = False
+					self.RotateToQr_pub()
+					
+
+					return
+			else:
+				self.visited_qr_side_2=False
+				self.publisher_shelf_data.publish(self.shelf_qr_data)
+				self.get_logger().info("data published")
+				self.clear_shelf_qr_data()
+
+				if self.shelf_number >= len(self.clusters):
+					self.exp_complete=True
+					self.get_logger().info("🎉 All shelves visited. Exploration complete.")
+					return
+
+				else:
+					self.select_next_shelf_from_heuristic()
+						 
+				
+
+	def check_shelf_after_goal(self):
+
+		# it checks if the diagonal shelf is the first shelf and if yes then store the objects and move to qr side
+		
+		
+		if self.shelf_qr_data.object_count or self.shelf_qr_data.object_name:
+			self.get_logger().info("////////////////////////Object/QR data found. Going to QR side..")
+
+			Shelf = self.clusters[self.shelf_idx]
+			x, y = Shelf['centroid_world']
+			Angle_deg = Shelf['angle_deg']
+			Width_m = Shelf['width_m']
+			Height_m = Shelf['height_m']
+
+			if Width_m < Height_m:
+				face_angle_deg = Angle_deg + 90
+			else:
+				face_angle_deg = Angle_deg
+
+			face_angle_deg = face_angle_deg % 360
+			
+			
+
+			offset_x, offset_y = self.offset_goal_away_from_shelf(x,y, face_angle_deg)
+			yaw_rad = self.create_yaw_from_vector(x,y,offset_x,offset_y)
+
+			
+			
+			
+			goal = self.create_goal_from_world_coord(offset_x, offset_y, yaw_rad)
+			success = self.send_goal_from_world_pose(goal)
+			if success:
+				self.get_logger().info("//////////////////////goal to QR side sent")
+
+	def select_first_shelf_from_initial_angle(self):
+	
+		if self.initial_angle is None:
+			self.get_logger().warn("Initial heuristic angle not set.")
+			return
+
+		if not hasattr(self, 'initial_ref_pose') or self.initial_ref_pose is None:
+			self.get_logger().warn("Initial reference pose not available.")
+			return
+
+		x0 = self.initial_ref_pose.pose.pose.position.x
+		y0 = self.initial_ref_pose.pose.pose.position.y
+
+		
+		best_angle_diff = float('inf')
+
+		for idx, cluster in enumerate(self.clusters):  # only among diagonal clusters
+			x1, y1 = cluster['centroid_world']
+			dx = x1 - x0
+			dy = y1 - y0
+
+			angle_to_cluster = math.degrees(math.atan2(dy, dx)) % 360
+			diff = abs(angle_to_cluster - self.initial_angle)
+			diff = min(diff, 360 - diff)
+
+			if diff < best_angle_diff:
+				best_angle_diff = diff
+				self.shelf_idx = idx
+
+		if self.shelf_idx is not None:
+			self.get_logger().info(f"🎯 First shelf selected by angle match: idx={self.shelf_idx}, angle diff={best_angle_diff:.2f}")
+			self.send_next_shelf_goal()
+		else:
+			self.get_logger().warn("⚠️ Could not find a matching shelf for initial angle.")
+
+
+	def extract_heuristic_angle(self, qr_data_str):
+		try:
+			parts = qr_data_str.split('_')
+			self.shelf_id=int(parts[0])
+			return float(parts[1])  # second part is angle
+		except (IndexError, ValueError):
+			return None
+		
+	def select_next_shelf_from_heuristic(self):
+		"""
+		Selects and navigates to the next shelf from all detected clusters based on the heuristic angle
+		decoded from the QR code.
+		"""
+		if self.heuristic_angle is None:
+			self.get_logger().warn("Heuristic angle not set. Cannot determine next shelf.")
+			return
+
+		# Current shelf position
+		current_cluster = self.clusters[self.shelf_idx]
+			
+	
+		x0, y0 = current_cluster['centroid_world']
+
+		self.best_idx = None
+		best_angle_diff = float('inf')
+
+		# Find the closest shelf in the heuristic direction
+		for idx, cluster in enumerate(self.clusters):
+			if idx == self.shelf_idx:
+				continue  # Skip the current shelf
+
+			x1, y1 = cluster['centroid_world']
+			dx = x1 - x0
+			dy = y1 - y0
+
+			# Compute angle between current shelf and candidate shelf
+			angle_to_candidate = math.degrees(math.atan2(dy, dx)) % 360
+			diff = abs(angle_to_candidate - self.heuristic_angle)
+			diff = min(diff, 360 - diff)  # Normalize to [0, 180]
+
+			if diff < best_angle_diff:
+				best_angle_diff = diff
+				self.best_idx = idx
+
+		if self.best_idx is not None:
+			self.shelf_idx = self.best_idx
+			selected_cluster = self.clusters[self.best_idx]
+
+			x, y = selected_cluster['centroid_world']
+			angle_deg = selected_cluster['angle_deg']
+			width = selected_cluster['width_m']
+			height = selected_cluster['height_m']
+
+			# Determine face angle
+			if width > height:
+				face_angle_deg = angle_deg + 90
+			else:
+				face_angle_deg = angle_deg
+			face_angle_deg = face_angle_deg % 360
+
+			# Offset to position the robot in front of the shelf
+			self.offset_x, self.offset_y = self.offset_goal_away_from_shelf(x, y, face_angle_deg)
+			self.yaw_rad = self.create_yaw_from_vector(x, y, self.offset_x, self.offset_y)
+
+			# Send goal to move to the new shelf
+			goal = self.create_goal_from_world_coord(self.offset_x, self.offset_y, self.yaw_rad)
+			success = self.send_goal_from_world_pose(goal)
+			if success:
+
+				self.shelf_number += 1
+				self.get_logger().info(f"✅ Sent goal to next shelf at cluster index {self.best_idx} with angle diff {best_angle_diff:.2f}")
+				self.get_logger().info(f"Sending goal to shelf at index {idx}, coords=({self.buggy_pose_x }, {self.buggy_pose_y})")
+
+			else:
+				self.get_logger().warn("⚠️ Failed to send goal to next shelf.")
+		else:
+			self.get_logger().warn("⚠️ No matching shelf found based on heuristic angle.")
+
+	def RotateToQr_pub(self):
+
+			self.get_logger().info("////////////////////////Object/QR data found. Going to QR side..")
+
+			Shelf = self.clusters[self.best_idx]
+			x, y = Shelf['centroid_world']
+			Angle_deg = Shelf['angle_deg']
+			Width_m = Shelf['width_m']
+			Height_m = Shelf['height_m']
+
+			if Width_m < Height_m:
+				face_angle_deg = Angle_deg + 90
+			else:
+				face_angle_deg = Angle_deg
+
+			face_angle_deg = face_angle_deg % 360
+			
+			
+
+			offset_x, offset_y = self.offset_goal_away_from_shelf(x,y, face_angle_deg)
+			yaw_rad = self.create_yaw_from_vector(x,y,offset_x,offset_y)
+			
+			
+			goal = self.create_goal_from_world_coord(offset_x, offset_y, yaw_rad)
+			success = self.send_goal_from_world_pose(goal)
+
+			if success:
+				self.get_logger().info("//////////////////////goal to QR side sent")
+
+
+	def camera_image_callback(self, message):
+			"""Callback function to handle incoming camera images.
+
+			Args:
+				message: ROS2 message of the type sensor_msgs.msg.CompressedImage.
+
+			Returns:
+				None
+			"""
+			
+			np_arr = np.frombuffer(message.data, np.uint8)
+			image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+			if image is None:
+				self.get_logger().warn("Failed to decode image")
+				return
+			
+			self.qr_text, points, smth = self.qr_detector.detectAndDecode(image)
+
+			
+
+			if self.qr_text:
+
+				self.get_logger().info(f"------------QR Code Detected: {self.qr_text}")
+				self.shelf_qr_data.qr_decoded=self.qr_text
+				self.heuristic_angle=self.extract_heuristic_angle(self.qr_text)
+
+
+
+	def shelf_objects_callback(self, message: WarehouseShelf):
+			"""Callback function to handle shelf objects updates.
+
+			Args:ws:
+			//localhost:8765
+				message: ROS2 message containing shelf objects data.
+
+			Returns:
+				None
+
+
+			"""
+
+			if len(self.shelf_qr_data.object_count)<len(message.object_count) or len(self.shelf_qr_data.object_count)== 0:
+					
+					self.shelf_objects_curr = message
+					self.shelf_qr_data.object_count=self.shelf_objects_curr.object_count
+					self.shelf_qr_data.object_name=self.shelf_objects_curr.object_name
+
+			
+
+			"""
+			* Example for sending WarehouseShelf messages for evaluation.
+				shelf_data_message = WarehouseShelf()
+
+				shelf_data_message.object_name = ["car", "clock"]
+				shelf_data_message.object_count = [1, 2]
+				shelf_data_message.qr_decoded = "test qr string"
+
+				self.publisher_shelf_data.publish(shelf_data_message)
+
+			* Alternatively, you may store the QR for current shelf as self.qr_code_str.
+				Then, add it as self.shelf_objects_curr.qr_decoded = self.qr_code_str
+				Then, publish as self.publisher_shelf_data.publish(self.shelf_objects_curr)
+				This, will publish the current detected objects with the last QR decoded.
+			"""
+
+			# Optional code for populating TABLE GUI with detected objects and QR data.
+			"""
+			if PROGRESS_TABLE_GUI:
+				shelf = self.shelf_objects_curr
+				obj_str = ""
+				for name, count in zip(shelf.object_name, shelf.object_count):
+					obj_str += f"{name}: {count}\n"
+
+				box_app.change_box_text(self.table_row_count, self.table_col_count, obj_str)
+				box_app.change_box_color(self.table_row_count, self.table_col_count, "cyan")
+				self.table_row_count += 1
+
+				box_app.change_box_text(self.table_row_count, self.table_col_count, self.qr_code_str)
+				box_app.change_box_color(self.table_row_count, self.table_col_count, "yellow")
+				self.table_row_count = 0
+				self.table_col_count += 1
+				"""
+	def clear_shelf_qr_data(self):
+		self.shelf_qr_data.object_name = []
+		self.shelf_qr_data.object_count = []
+		self.shelf_qr_data.qr_decoded = ""
+
+	
+	
+
+
 
 	def get_frontiers_for_space_exploration(self, map_array):
 		"""Identifies frontiers for space exploration.
@@ -364,21 +980,7 @@ class WarehouseExplore(Node):
 			message.data = encoded_data.tobytes()
 			publisher.publish(message)
 
-	def camera_image_callback(self, message):
-		"""Callback function to handle incoming camera images.
 
-		Args:
-			message: ROS2 message of the type sensor_msgs.msg.CompressedImage.
-
-		Returns:
-			None
-		"""
-		np_arr = np.frombuffer(message.data, np.uint8)
-		image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-		# Process the image from front camera as needed.
-
-		# Optional line for visualizing image on foxglove.
-		# self.publish_debug_image(self.publisher_qr_decode, image)
 
 	def cerebri_status_callback(self, message):
 		"""Callback function to handle cerebri status updates.
@@ -414,53 +1016,6 @@ class WarehouseExplore(Node):
 				# self.goal_completed = True
 				# self.goal_handle_curr = None
 				pass
-
-	def shelf_objects_callback(self, message):
-		"""Callback function to handle shelf objects updates.
-
-		Args:
-			message: ROS2 message containing shelf objects data.
-
-		Returns:
-			None
-		"""
-		self.shelf_objects_curr = message
-		# Process the shelf objects as needed.
-
-		# How to send WarehouseShelf messages for evaluation.
-		"""
-		* Example for sending WarehouseShelf messages for evaluation.
-			shelf_data_message = WarehouseShelf()
-
-			shelf_data_message.object_name = ["car", "clock"]
-			shelf_data_message.object_count = [1, 2]
-			shelf_data_message.qr_decoded = "test qr string"
-
-			self.publisher_shelf_data.publish(shelf_data_message)
-
-		* Alternatively, you may store the QR for current shelf as self.qr_code_str.
-			Then, add it as self.shelf_objects_curr.qr_decoded = self.qr_code_str
-			Then, publish as self.publisher_shelf_data.publish(self.shelf_objects_curr)
-			This, will publish the current detected objects with the last QR decoded.
-		"""
-
-		# Optional code for populating TABLE GUI with detected objects and QR data.
-		"""
-		if PROGRESS_TABLE_GUI:
-			shelf = self.shelf_objects_curr
-			obj_str = ""
-			for name, count in zip(shelf.object_name, shelf.object_count):
-				obj_str += f"{name}: {count}\n"
-
-			box_app.change_box_text(self.table_row_count, self.table_col_count, obj_str)
-			box_app.change_box_color(self.table_row_count, self.table_col_count, "cyan")
-			self.table_row_count += 1
-
-			box_app.change_box_text(self.table_row_count, self.table_col_count, self.qr_code_str)
-			box_app.change_box_color(self.table_row_count, self.table_col_count, "yellow")
-			self.table_row_count = 0
-			self.table_col_count += 1
-		"""
 
 	def rover_move_manual_mode(self, speed, turn):
 		"""Operates the rover in manual mode by publishing on /cerebri/in/joy.
@@ -506,23 +1061,10 @@ class WarehouseExplore(Node):
 			cancel_future = self.action_client._cancel_goal_async(self.goal_handle_curr)
 			cancel_future.add_done_callback(self.cancel_goal_callback)
 
-	def goal_result_callback(self, future):
-		"""
-		Callback function executed when the navigation goal reaches a final result.
+		
 
-		Args:
-			future (rclpy.Future): The future that is result of the navigation action.
-		"""
-		status = future.result().status
-		# NOTE: Refer https://docs.ros2.org/foxy/api/action_msgs/msg/GoalStatus.html.
 
-		if status == GoalStatus.STATUS_SUCCEEDED:
-			self.logger.info("Goal completed successfully!")
-		else:
-			self.logger.warn(f"Goal failed with status: {status}")
-
-		self.goal_completed = True  # Mark goal as completed.
-		self.goal_handle_curr = None  # Clear goal handle.
+		
 
 	def goal_response_callback(self, future):
 		"""
@@ -564,6 +1106,7 @@ class WarehouseExplore(Node):
 		if number_of_recoveries > self.recovery_threshold and not self.cancelling_goal:
 			self.logger.warn(f"Cancelling. Recoveries = {number_of_recoveries}.")
 			self.cancel_current_goal()  # Unblock by discarding the current goal.
+		
 
 	def send_goal_from_world_pose(self, goal_pose):
 		"""
