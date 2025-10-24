@@ -125,6 +125,9 @@ class WarehouseExplore(Node):
 		self.flag_for_one_call=True
 		self.reached_offset_goal = False 
 		self.first_extra_offset=True
+		self.no_need = False
+		self.exploration_complete = False
+		self.all_shelves_visited = False
 		
 		
 		self.diagonal_clusters = []
@@ -452,9 +455,10 @@ class WarehouseExplore(Node):
 			if closest_frontier:
 				fy, fx = closest_frontier
 				goal = self.create_goal_from_map_coord(fx, fy, map_info)
-				self.send_goal_from_world_pose(goal)
-				print("Sending goal for space exploration.")
-				return
+				if not self.all_shelves_visited:
+					self.send_goal_from_world_pose(goal)
+					print("Sending goal for space exploration.")
+					return
 			else:
 				self.max_step_dist_world_meters += 2.0
 				new_min_step_dist = self.min_step_dist_world_meters - 1.0
@@ -464,21 +468,14 @@ class WarehouseExplore(Node):
 		else:
 			self.full_map_explored_count += 1
 
-			self.get_logger().info("No frontiers found. Proceeding to clustering.")
+			self.get_logger().info("No more frontiers — switching to shelf clustering mode.")
 
+			# Just trigger clustering once when exploration fully ends
 			self.clusters = self.get_clusters_dbscan(map_array, map_info, plot=False)
-
-			
-			self.in_shelf_mode = True
-
-			if self.in_shelf_mode  and self.flag_for_one_call:
-
-				self.shelf_qr_data.object_count=[]
-				self.shelf_qr_data.object_name=[]
-
-				
+			if not self.no_need:
+				self.in_shelf_mode = True
 				self.select_first_shelf_from_initial_angle()
-				self.flag_for_one_call=False
+
 				
 
 	def send_next_shelf_goal(self):
@@ -544,7 +541,26 @@ class WarehouseExplore(Node):
 		self.get_logger().info(f"check {self.shelf_qr_data.object_name}")
 
 
-		
+		# 🧠 Re-run clustering dynamically after every goal
+		if self.global_map_curr :
+
+			height, width = self.global_map_curr.info.height, self.global_map_curr.info.width
+			map_array = np.array(self.global_map_curr.data).reshape((height, width))
+			map_info = self.global_map_curr.info
+
+			clusters = self.get_clusters_dbscan(map_array, map_info, plot=False)
+			shelf_like = [c for c in clusters if
+						abs(c['width_m'] - 1.4) < 0.25 or abs(c['height_m'] - 0.5) < 0.25
+						or abs(c['width_m'] - 0.5) < 0.25 or abs(c['height_m'] - 1.4) < 0.25]
+
+			if len(shelf_like) >= self.shelf_count and not self.exploration_complete:
+				self.logger.info(f"📦 Found {len(shelf_like)} shelves after goal — reselecting based on initial angle.")
+				self.clusters = shelf_like
+				self.exploration_complete = True
+				self.no_need = True
+				self.in_shelf_mode = True
+				self.select_first_shelf_from_initial_angle()
+
 			
 
 		#only for first shelf
@@ -637,6 +653,7 @@ class WarehouseExplore(Node):
 				if self.shelf_number >= len(self.clusters):
 					self.exp_complete=True
 					self.get_logger().info("🎉 All shelves visited. Exploration complete.")
+					self.all_shelves_visited = True
 					return
 
 				else:
@@ -944,7 +961,7 @@ class WarehouseExplore(Node):
 						if map_array[ny, nx] > 0:  # Obstacles.
 							near_obstacle = True
 							break
-					if near_obstacle:
+					if not near_obstacle:
 						continue
 
 					neighbors_cardinal = [
