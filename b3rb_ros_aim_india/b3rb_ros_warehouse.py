@@ -128,6 +128,7 @@ class WarehouseExplore(Node):
 		self.no_need = False
 		self.exploration_complete = False
 		self.all_shelves_visited = False
+		self.run_once = True
 		
 		
 		self.diagonal_clusters = []
@@ -135,10 +136,13 @@ class WarehouseExplore(Node):
 		self.visited_qr_side_2=False
 		self.heuristic_angle = None
 
+		self.recent_goals = []         		# store last few visited frontier positions
+		self.revisit_distance_thresh = 3.0  # meters — minimum distance between new goals
+		self.max_recent_goals = 5
+
+
 
 		self.allowed_objects = ['banana', 'car', 'clock', 'cup', 'horse', 'potted plant', 'teddy bear', 'zebra']
-
-
 
 
 		self.shelf_number=1
@@ -419,69 +423,117 @@ class WarehouseExplore(Node):
 
 	def global_map_callback(self, message):
 		"""Callback function to handle global map updates.
-
-		Args:
-			message: ROS2 message containing the global map data.
-
-		Returns:
-			None
+		Prioritizes frontiers near shelves/obstacles but ignores map boundaries.
 		"""
 		self.global_map_curr = message
-		
-
 		if not self.goal_completed:
 			return
+		# Record last goal position to prevent revisiting nearby frontiers
+		if self.goal_handle_curr:
+			goal_pose = self.goal_handle_curr.goal_request.goal.pose.pose.position
+			self.recent_goals.append((goal_pose.x, goal_pose.y))
+			if len(self.recent_goals) > self.max_recent_goals:
+				self.recent_goals.pop(0)  # keep it limited
+
 
 		height, width = self.global_map_curr.info.height, self.global_map_curr.info.width
+		map_info = self.global_map_curr.info
 		map_array = np.array(self.global_map_curr.data).reshape((height, width))
 
-		frontiers = self.get_frontiers_for_space_exploration(map_array)
-
-		map_info = self.global_map_curr.info
-		if frontiers:
-			closest_frontier = None
-			min_distance_curr = float('inf')
-
-			for fy, fx in frontiers:
-				fx_world, fy_world = self.get_world_coord_from_map_coord(fx, fy,
-											 map_info)
-				distance = euclidean((fx_world, fy_world), self.buggy_center)
-				if (distance < min_distance_curr and
-				    distance <= self.max_step_dist_world_meters and
-				    distance >= self.min_step_dist_world_meters):
-					min_distance_curr = distance
-					closest_frontier = (fy, fx)
-
-			if closest_frontier:
-				fy, fx = closest_frontier
-				goal = self.create_goal_from_map_coord(fx, fy, map_info)
-				if not self.all_shelves_visited:
-					self.send_goal_from_world_pose(goal)
-					print("Sending goal for space exploration.")
-					return
+		clusters = self.get_clusters_dbscan(map_array, map_info, plot=False)
+		shelf_like = [c for c in clusters if
+					abs(c['width_m'] - 1.4) < 0.25 or abs(c['height_m'] - 0.5) < 0.25
+					or abs(c['width_m'] - 0.5) < 0.25 or abs(c['height_m'] - 1.4) < 0.25]
+		
+		if self.run_once:
+			if len(shelf_like) >= self.shelf_count and not self.exploration_complete:
+				self.logger.info(f"📦 Found {len(shelf_like)} shelves after goal — reselecting based on initial angle.")
+				self.clusters = shelf_like
+				self.exploration_complete = True
+				self.no_need = True
+				self.in_shelf_mode = True
+				self.select_first_shelf_from_initial_angle()
 			else:
-				self.max_step_dist_world_meters += 2.0
-				new_min_step_dist = self.min_step_dist_world_meters - 1.0
-				self.min_step_dist_world_meters = max(0.25, new_min_step_dist)
+				self.get_logger().info("all shelves not detected yet")
+			self.run_once = False
 
-			self.full_map_explored_count = 0
-		else:
+		# --- Convert 3 m to pixels ---
+		boundary_margin = int(2.0 / map_info.resolution)
+
+		# --- Find frontiers ---
+		frontiers = self.get_frontiers_for_space_exploration(map_array)
+		if not frontiers:
 			self.full_map_explored_count += 1
-
 			self.get_logger().info("No more frontiers — switching to shelf clustering mode.")
-
-			# Just trigger clustering once when exploration fully ends
 			self.clusters = self.get_clusters_dbscan(map_array, map_info, plot=False)
 			if not self.no_need:
 				self.in_shelf_mode = True
 				self.select_first_shelf_from_initial_angle()
+			return
 
-				
+		# ---------------------------------------------------------------------- #
+		# Filter out frontiers too close to map edges (< 3 m)
+		# ---------------------------------------------------------------------- #
+		filtered_frontiers = []
+		for fy, fx in frontiers:
+			if (fx < boundary_margin or fy < boundary_margin or
+				fx > width - boundary_margin or fy > height - boundary_margin):
+				continue  # skip near-boundary cells
+			filtered_frontiers.append((fy, fx))
+
+		if not filtered_frontiers:
+			self.get_logger().warn("All frontiers near boundary — waiting for new map update.")
+			return
+
+		# ---------------------------------------------------------------------- #
+		# Choose best frontier based on obstacle density + distance penalty
+		# ---------------------------------------------------------------------- #
+		best_score = -float('inf')
+		best_frontier = None
+
+		for fy, fx in filtered_frontiers:
+			fx_world, fy_world = self.get_world_coord_from_map_coord(fx, fy, map_info)
+			distance = euclidean((fx_world, fy_world), self.buggy_center)
+
+			# obstacle density
+			y0, y1 = max(0, fy - 3), min(map_array.shape[0], fy + 4)
+			x0, x1 = max(0, fx - 3), min(map_array.shape[1], fx + 4)
+			window = map_array[y0:y1, x0:x1]
+			obstacle_density = np.sum(window > 0) / window.size
+
+			# compute penalty for being near a previously visited goal
+			penalty = 0.0
+			for gx, gy in self.recent_goals:
+				dist_prev = euclidean((fx_world, fy_world), (gx, gy))
+				if dist_prev < self.revisit_distance_thresh:
+					penalty += (self.revisit_distance_thresh - dist_prev) * 3.0  # stronger if closer
+
+			# combine into final score
+			score = obstacle_density * 3.0 + 0.25 * distance - penalty
+
+			self.get_logger().debug(
+				f"Frontier ({fx:.1f},{fy:.1f}) | obs={obstacle_density:.2f} | dist={distance:.2f} | penalty={penalty:.2f} | score={score:.2f}"
+			)
+
+			if score > best_score:
+				best_score = score
+				self.get_logger().info(f"score : {score} , best score : {best_score}")
+				best_frontier = (fy, fx)
+
+		# ---------------------------------------------------------------------- #
+		# Send goal if valid frontier found
+		# ---------------------------------------------------------------------- #
+		if best_frontier and not self.exploration_complete:
+			fy, fx = best_frontier
+			goal = self.create_goal_from_map_coord(fx, fy, map_info)
+			self.send_goal_from_world_pose(goal)
+			self.get_logger().info(f"🚀 Exploring frontier near obstacles at ({fx}, {fy})")
+		else:
+			self.get_logger().warn("⚠️ No valid frontier found within 3 m-safe zone.")
+
+						
 
 	def send_next_shelf_goal(self):
-		
-		
-
 
 		shelf = self.clusters[self.shelf_idx]
 		x, y = shelf['centroid_world']
@@ -539,6 +591,9 @@ class WarehouseExplore(Node):
 		self.goal_handle_curr = None  # Clear goal handle.
 
 		self.get_logger().info(f"check {self.shelf_qr_data.object_name}")
+
+		if self.all_shelves_visited:
+			return
 
 
 		# 🧠 Re-run clustering dynamically after every goal
@@ -808,6 +863,7 @@ class WarehouseExplore(Node):
 				self.get_logger().warn("⚠️ Failed to send goal to next shelf.")
 		else:
 			self.get_logger().warn("⚠️ No matching shelf found based on heuristic angle.")
+			
 
 	def RotateToQr_pub(self):
 
